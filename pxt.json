@@ -1,0 +1,39 @@
+{
+    "name": "Cutebot_OP_v0.1",
+    "description": "",
+    "dependencies": {
+        "core": "*",
+        "microphone": "*",
+        "bluetooth": "*",
+        "cutebot": "github:elecfreaks/pxt-cutebot#v6.2.4"
+    },
+    "files": [
+        "main.blocks",
+        "main.ts",
+        "README.md",
+        "main.py"
+    ],
+    "testFiles": [
+        "test.ts"
+    ],
+    "targetVersions": {
+        "target": "8.0.17",
+        "targetId": "microbit"
+    },
+    "supportedTargets": [
+        "microbit"
+    ],
+    "preferredEditor": "tsprj",
+    "yotta": {
+        "config": {
+            "microbit-dal": {
+                "bluetooth": {
+                    "open": 1,
+                    "pairing_mode": 0,
+                    "whitelist": 0,
+                    "security_level": null
+                }
+            }
+        }
+    }
+}

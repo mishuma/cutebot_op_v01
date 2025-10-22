@@ -1,0 +1,20 @@
+<xml xmlns="https://developers.google.com/blockly/xml"><variables><variable id="y_I7og=K1+hl}O_4/qb;">bleConnected</variable><variable id="](5e[stlsG_ssIAIIhM0">d</variable><variable id="IdeJ/P^a#Vn2X[rLgd5M">t</variable><variable id="#;yrbqUAUD?PB{|*1Y[i">q</variable><variable id="DvFb~QP;Lm(;?C3;q~%#">line</variable><variable id="a|f[-Y+i.jCH]N(?4ll7">parts</variable><variable id="4)m-TU+K.AtkG_1KNIeR">core</variable><variable id="{W9.v0).NR68_,Qm/To=">busy</variable><variable id="@m@-Ue3OK?=Y6FZOFYRE">cmd</variable><variable id="k.hm9|Z#os50|-5W%kHq">raw</variable><variable id="PDNl|dc%)wEixUvkY4BO">cmd2</variable><variable id="5`Yi_HT[Ema;fJf)5+aI">QDEPTH</variable><variable id="vadM6WUIUEojn!e#!Bip">g</variable></variables><comment id="sSJ{uF##2,I0%i$j]K0`" x="748" y="4481" w="480" h="360">
+===== Cutebot + BLE UART Command Processor (TypeScript) =====
+Commands from app (newline-terminated): :SEQ,OP,ARGS*\n
+SEQ = 2 hex digits (00..FF), OP = MV|SP|TL|TR|BK|HL|BZ|EC
+
+ARGS:
+MV,left,right         -&gt; motors(left,right) -100..100 (negatives reverse)
+SP,00                 -&gt; stop
+TL,00 / TR,00         -&gt; turn left/right (instant)
+BK,ss                 -&gt; backward via motors(-ss,-ss); default 50
+HL,01|00              -&gt; headlights on/off (white)
+HL,RR,GG,BB           -&gt; headlights to RGB color (0..FF each)
+BZ,HH,LL,DD           -&gt; buzzer freq=(HH&lt;&lt;8)|LL Hz, dur=DD*10ms (DD=0-&gt;100ms)
+EC,00                 -&gt; echo/no-op
+
+Replies: :SEQ,ACK | :SEQ,BUSY | :SEQ,ERR,EC
+Telemetry pushes: #DIST,cc (cm), #LED,rrggbb, #BUZ,done
+</comment><comment id="KoD/f564s-wDcA6gEoyw" x="1273" y="4481" w="330" h="120">
+---------- UI feedback ----------
+</comment><block type="argument_reporter_string" id="LJ{)?Q8Ubq/|^;,_W;L%" disabled-reasons="pxt_automatic_disabled" x="0" y="0"><field name="VALUE">s</field></block><block type="argument_reporter_string" id="K(y(=8tBI06Q+SCxlV-." disabled-reasons="pxt_automatic_disabled" x="0" y="0"><field name="VALUE">raw</field></block></xml>
