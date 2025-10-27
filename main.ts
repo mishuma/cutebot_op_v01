@@ -1,59 +1,55 @@
-// ===== Cutebot + BLE UART Command Processor (TypeScript) =====
-// Commands from app (newline-terminated): :SEQ,OP,ARGS*\n
-// SEQ = 2 hex digits (00..FF), OP = MV|SP|TL|TR|BK|HL|BZ|EC
+// ===== Cutebot + BLE UART (Immediate Exec, semicolon-delimited, timed arrows, ECHO + descriptive ACKs) =====
 //
-// ARGS:
-//   MV,left,right         -> motors(left,right) -100..100 (negatives reverse)
-//   SP,00                 -> stop
-//   TL,00 / TR,00         -> turn left/right (instant)
-//   BK,ss                 -> backward via motors(-ss,-ss); default 50
-//   HL,01|00              -> headlights on/off (white)
-//   HL,RR,GG,BB           -> headlights to RGB color (0..FF each)
-//   BZ,HH,LL,DD           -> buzzer freq=(HH<<8)|LL Hz, dur=DD*10ms (DD=0->100ms)
-//   EC,00                 -> echo/no-op
+// Command format (starts and ends with ';'):
+//   ;SEQ,OP,ARG1,ARG2;
 //
-// Replies: :SEQ,ACK | :SEQ,BUSY | :SEQ,ERR,EC
-// Telemetry pushes: #DIST,cc (cm), #LED,rrggbb, #BUZ,done
+// Two-arg interface for movement & stop:
+//   MV (forward)  : ARG1 = speed, ARG2 = duration (seconds)
+//   BK (backward) : ARG1 = speed, ARG2 = duration (seconds)
+//   TL (turn left): ARG1 = speed, ARG2 = duration (seconds)
+//   TR (turn right):ARG1 = speed, ARG2 = duration (seconds)
+//   SP (hard stop): ARG1 = 0, ARG2 = 0  (dummy args, same interface)
+//
+// Other:
+//   HL (headlights): RGB or on/off (see code)
+//   BZ (buzzer)    : freq hi, freq lo, duration*10ms
+//   EC (echo)      : acknowledgment only
+//
+// Replies (newline-terminated):
+//   #ECHO,<raw line>\n
+//   ;SEQ,ACK,OP;\n     (or ;00,ACK,??;\n if parse failed)
+//   #LED,rrggbb\n      (after HL)
+//   #BUZ,done\n        (after BZ)
+//
+// Notes:
+// - Arrows show only during the commanded movement duration, then revert to a wait icon.
+// - No queue: executes each command immediately when received.
 
 bluetooth.startUartService()
 
-// ---------- UI feedback ----------
-let bleConnected = false
+const DELIM = ";"  // semicolon delimiter
 
-bluetooth.onBluetoothConnected(function () {
-    bleConnected = true
-    basic.showIcon(IconNames.Heart)
-})
+interface Cmd { s: number; o: string; a: number; b: number; c: number }
 
-bluetooth.onBluetoothDisconnected(function () {
-    bleConnected = false
-    basic.clearScreen()
+// ---------- UI helpers ----------
+function showWait() {
     basic.showIcon(IconNames.SmallDiamond)
-})
+}
+function showStopBrief() {
+    basic.showIcon(IconNames.No)
+    basic.pause(150)
+    showWait()
+}
 
-// --- Button A: show card name quickly ---
-input.onButtonPressed(Button.A, function () {
-    // display BLE device name quickly
-    basic.showString(control.deviceName(), 50)
-    // restore icon based on BLE state
-    if (bleConnected) basic.showIcon(IconNames.Heart)
-    else basic.showIcon(IconNames.SmallDiamond)
-})
-
-// ---------- types ----------
-type Cmd = { s: number, o: string, a: number, b: number, c: number }
-
-// ---------- helpers ----------
+// ---------- misc helpers ----------
 function hex2(n: number) {
     n &= 0xFF
     const d = "0123456789ABCDEF"
     return d.charAt((n >> 4) & 0xF) + d.charAt(n & 0xF)
 }
-
 function parseHexByte(s: string) {
-    if (!s) return 0
-    const t = s.trim().toUpperCase()
-    if (t.length == 0) return 0
+    const t = s ? s.trim().toUpperCase() : ""
+    if (!t || t.length == 0) return 0
     let v = 0
     for (let i = 0; i < t.length && i < 2; i++) {
         const c = t.charCodeAt(i)
@@ -65,142 +61,137 @@ function parseHexByte(s: string) {
     }
     return v & 0xFF
 }
-
-function clamp(v: number, lo: number, hi: number) {
-    return Math.max(lo, Math.min(hi, v))
-}
-
 function send(line: string) { bluetooth.uartWriteString(line) }
-function sendAck(seq: number) { send(":" + hex2(seq) + ",ACK\n") }
-function sendBusy(seq: number) { send(":" + hex2(seq) + ",BUSY\n") }
-function sendErr(seq: number, ec: number) { send(":" + hex2(seq) + ",ERR," + hex2(ec) + "\n") }
+function sendAckWithOp(seq: number, opEcho: string) { send(DELIM + hex2(seq) + ",ACK," + opEcho + DELIM + "\n") }
+function sendErr(seq: number, ec: number) { send(DELIM + hex2(seq) + ",ERR," + hex2(ec) + DELIM + "\n") }
 
-// ---------- queue ----------
-const QDEPTH = 6
-const q: Cmd[] = []
-let busy = false
-
-function qPush(c: Cmd) {
-    if (q.length >= QDEPTH) return false
-    q.push(c)
-    return true
-}
-function qPop(): Cmd | null {
-    if (q.length == 0) return null
-    return q.shift()
+function hardStop() {
+    cuteBot.motors(0, 0)
+    try { cuteBot.stopcar() } catch (e) { }
 }
 
-// ---------- parser ----------
-function parseLine(raw: string): Cmd | null {
-    if (!raw) return null
-    // MakeCode-safe: String.replace doesn't take RegExp; use split/join
-    const line = raw.split("\r").join("").trim()
-    if (line.length < 5) return null
-    if (line.charAt(0) != ":") return null
-
-    const core = line.substr(1).trim()
-    const parts = core.split(",")
+// ---------- parsing utilities ----------
+function sanitize(raw: string): string {
+    if (!raw) return ""
+    let out = ""
+    for (let i = 0; i < raw.length; i++) {
+        const code = raw.charCodeAt(i)
+        const ch = raw.charAt(i)
+        if (code < 32) continue       // drop control chars
+        if (ch == ";") continue       // drop stray delimiters
+        out += ch
+    }
+    return out.trim()
+}
+function guessOp(raw: string): string {
+    const clean = sanitize(raw)
+    if (!clean) return "??"
+    let s = clean
+    if (s.charAt(0) == ";") s = s.substr(1)
+    const parts = s.split(",")
+    if (parts.length < 2) return "??"
+    const op = parts[1].trim().toUpperCase()
+    if (op == "MV" || op == "BK" || op == "TL" || op == "TR" || op == "SP" || op == "HL" || op == "BZ" || op == "EC")
+        return op
+    return "??"
+}
+function parseLine(line: string): Cmd {
+    const clean = sanitize(line)
+    if (!clean || clean.length < 2) return null
+    let s = clean
+    if (s.charAt(0) == ";") s = s.substr(1)
+    const parts = s.split(",")
     if (parts.length < 2) return null
-
-    const seq = parseInt(parts[0], 16)
-    const op = (parts[1] || "").toUpperCase()
+    const seqHex = parts[0]
+    let seqNum = 0
+    if (seqHex && seqHex.length > 0) {
+        const tmp = parseInt(seqHex, 16)
+        if (!isNaN(tmp)) seqNum = tmp & 0xFF
+    }
+    const op = (parts[1] || "").trim().toUpperCase()
+    if (!op) return null
     const a = parts.length > 2 ? parseHexByte(parts[2]) : 0
     const b = parts.length > 3 ? parseHexByte(parts[3]) : 0
     const c = parts.length > 4 ? parseHexByte(parts[4]) : 0
-    return { s: isNaN(seq) ? 0 : (seq & 0xFF), o: op, a: a, b: b, c: c }
+    return { s: seqNum, o: op, a: a, b: b, c: c }
 }
 
 // ---------- executor ----------
-function runOne(cmd: Cmd, done: () => void) {
+function runNow(cmd: Cmd) {
     switch (cmd.o) {
-        case "MV": {
-            const L = clamp(cmd.a, -100, 100)
-            const R = clamp(cmd.b, -100, 100)
-            cuteBot.motors(L, R)
+        case "MV": { // forward (speed, duration)
+            basic.showArrow(ArrowNames.South)
+            cuteBot.moveTime(cuteBot.Direction.forward, cmd.a, cmd.b)
+            showWait()
             break
         }
-        case "SP":
-            cuteBot.stopcar()
+        case "BK": { // backward (speed, duration)
+            basic.showArrow(ArrowNames.North)
+            cuteBot.moveTime(cuteBot.Direction.backward, cmd.a, cmd.b)
+            showWait()
             break
-        case "TL":
-            cuteBot.turnleft()
+        }
+        case "TL": { // left (speed, duration)
+            basic.showArrow(ArrowNames.East)
+            cuteBot.moveTime(cuteBot.Direction.left, cmd.a, cmd.b)
+            showWait()
             break
-        case "TR":
-            cuteBot.turnright()
+        }
+        case "TR": { // right (speed, duration)
+            basic.showArrow(ArrowNames.West)
+            cuteBot.moveTime(cuteBot.Direction.right, cmd.a, cmd.b)
+            showWait()
             break
-        case "BK": {
-            const spd = cmd.a > 0 ? clamp(cmd.a, 0, 100) : 50
-            cuteBot.motors(-spd, -spd)
+        }
+        case "SP": { // hard stop (dummy args 0,0)
+            hardStop()
+            showStopBrief()
             break
         }
         case "HL": {
+            let color: number
             if (cmd.b > 0 || cmd.c > 0) {
-                const color = ((cmd.a & 0xFF) << 16) | ((cmd.b & 0xFF) << 8) | (cmd.c & 0xFF)
+                color = ((cmd.a & 0xFF) << 16) | ((cmd.b & 0xFF) << 8) | (cmd.c & 0xFF)
                 cuteBot.colorLight(cuteBot.RGBLights.ALL, color)
-                const rr = hex2((color >> 16) & 0xFF)
-                const gg = hex2((color >> 8) & 0xFF)
-                const bb = hex2(color & 0xFF)
-                send("#LED," + rr + gg + bb + "\n")
             } else {
-                const on = (cmd.a & 0xFF) != 0
-                const color = on ? 0xFFFFFF : 0x000000
+                color = cmd.a ? 0xFFFFFF : 0x000000
                 cuteBot.colorLight(cuteBot.RGBLights.ALL, color)
-                const rr = hex2((color >> 16) & 0xFF)
-                const gg = hex2((color >> 8) & 0xFF)
-                const bb = hex2(color & 0xFF)
-                send("#LED," + rr + gg + bb + "\n")
             }
+            const rr = hex2((color >> 16) & 0xFF)
+            const gg = hex2((color >> 8) & 0xFF)
+            const bb = hex2(color & 0xFF)
+            send("#LED," + rr + gg + bb + "\n")
+            // keep wait icon; no change here
             break
         }
         case "BZ": {
-            const freq = clamp(((cmd.a & 0xFF) << 8) | (cmd.b & 0xFF), 100, 5000)
+            const freq = ((cmd.a & 0xFF) << 8) | (cmd.b & 0xFF)
             let dur = (cmd.c & 0xFF) * 10
             if (dur <= 0) dur = 100
-            music.playTone(freq, dur)
-            control.inBackground(() => {
-                basic.pause(dur)
-                send("#BUZ,done\n")
-            })
+            const f = Math.max(100, Math.min(5000, freq))
+            music.playTone(f, dur)   // blocks for dur
+            send("#BUZ,done\n")
+            // keep wait icon; no change here
             break
         }
         case "EC":
+            // no-Op; keep wait icon
             break
         default:
             sendErr(cmd.s, 0x01)
-            done()
             return
     }
-
-    control.inBackground(() => {
-        basic.pause(10)
-        sendAck(cmd.s)
-        done()
-    })
 }
 
-function pump() {
-    if (busy || q.length == 0) return
-    busy = true
-    const cmd: Cmd | null = qPop()
-    if (!cmd) { busy = false; return }
-    runOne(cmd, () => { busy = false; pump() })
-}
-
-// ---------- BLE receive ----------
-bluetooth.onUartDataReceived("\n", function () {
-    const raw = bluetooth.uartReadUntil("\n")
-    const cmd: Cmd | null = parseLine(raw)
-    if (!cmd) {
-        sendErr(0x00, 0x02)
-        return
-    }
-    if (busy && q.length >= QDEPTH) { sendBusy(cmd.s); return }
-    if (!qPush(cmd)) { sendBusy(cmd.s); return }
-    pump()
+// ---------- BLE receive using ';' ----------
+bluetooth.onUartDataReceived(DELIM, function () {
+    const raw = bluetooth.uartReadUntil(DELIM) || ""
+    send("#ECHO," + raw + "\n")
+    const cmd = parseLine(raw)
+    if (!cmd) { sendAckWithOp(0, guessOp(raw)); return }
+    runNow(cmd)
+    sendAckWithOp(cmd.s, cmd.o ? cmd.o : "??")
 })
 
-// ---------- telemetry loop ----------
-loops.everyInterval(500, function () {
-    const d = cuteBot.ultrasonic(cuteBot.SonarUnit.Centimeters)
-    bluetooth.uartWriteString("#DIST," + d + "\n")
-})
+// Show wait icon on boot
+showWait()
