@@ -1,116 +1,87 @@
-// ===== Cutebot + BLE UART Control (Timed Commands + GO opcode + tracking telemetry) =====
+// ===== Cutebot + BLE UART Control (Per-wheel hex speeds + ms durations + GO using pause) =====
 //
 // 🧩 Command Protocol
 // -------------------
-// Each command starts and ends with ';'
+// Format (each command starts & ends with ';'):
 //   ;SEQ,OP,ARG1,ARG2;
 //
-// Two-argument interface for movement & stop (ARG2 now in milliseconds):
-//   MV (Move Forward) : ARG1 = speed (0–100), ARG2 = duration (ms)
-//   BK (Move Backward): ARG1 = speed (0–100), ARG2 = duration (ms)
-//   TL (Turn Left)    : ARG1 = speed (0–100), ARG2 = duration (ms)
-//   TR (Turn Right)   : ARG1 = speed (0–100), ARG2 = duration (ms)
-//   SP (Hard Stop)    : ARG1 = 0, ARG2 = 0 (dummy arguments)
+// ARG1 (speed): hexadecimal 00..FF
+//   - High nibble (0..F) = LEFT wheel speed
+//   - Low  nibble (0..F) = RIGHT wheel speed
+//   - Each nibble scaled 0..F → 0..100 internally
 //
-// New opcode:
-//   GO (Timed Run)    : ARG1 = speed (0–100), ARG2 = duration (ms)
-//       → Starts both motors at ARG1 speed. After ARG2 ms, stops abruptly,
-//         sends #TRK telemetry, and returns to the wait icon.
+// ARG2 (duration): decimal milliseconds
 //
-// Other commands:
-//   HL (Headlights)   : RGB or on/off (see code)
-//   BZ (Buzzer)       : freq-hi, freq-lo, duration*10ms
-//   EC (Echo)         : test/no-op (no response)
+// Opcodes
+//   MV : forward   — per-wheel speeds from ARG1, runs for ARG2 ms
+//   BK : backward  — per-wheel speeds (negated), runs ARG2 ms
+//   TL : turn left — left negated, right positive, runs ARG2 ms
+//   TR : turn right— left positive, right negated, runs ARG2 ms
+//   SP : hard stop — ARG1=00, ARG2=00 (dummy args)
+//   GO : like MV but uses per-wheel speeds & dynamic arrow; runs ARG2 ms via basic.pause()
+//   HL : headlights (RGB/on-off)
+//   BZ : buzzer (freq_hi, freq_lo, dur*10 ms)
+//   EC : echo/no-op (ignored)
 //
-// 🧾 Responses
-// ------------
-//   #TRK,<n>\n        Tracking telemetry (sent at startup and after each move/stop/GO)
-//   #ERROR,<text>\n   On bad opcode or parse failure
+// 🔁 Responses
+//   #TRK,<n>\n   — tracking telemetry at startup and after each move/stop
+//   #ERROR,<t>\n — error on parse failure or unknown opcode
 //
-// Tracking state (#TRK values):
-//   0 = none, 1 = right only, 2 = left only, 3 = both sensors active
+// Tracking state (#TRK):
+//   0 = none, 1 = right only, 2 = left only, 3 = both active
 //
-// 🧠 Notes
-// --------
-// - ARG2 values are interpreted as milliseconds (converted to seconds where needed).
-// - The GO command uses a software timer to enforce duration-based stopping.
-// - Only two message types are sent: #TRK and #ERROR.
-// - Tracking state is sent at startup and after any motion command or stop.
-//
+// Notes
+// - Only #TRK and #ERROR are sent back.
+// - Movement arrows show during motion, then revert to "wait" icon.
+// - GO now uses the same blocking timing as MV (no software timer).
 // ---------------------------------------------------------------------------
 
 bluetooth.startUartService()
 
-// Command delimiter
-const DELIM = ";"
+const DELIM = ";" // command delimiter
 
 // Cutebot line tracking sensors (active-low)
 const TRACK_RIGHT = DigitalPin.P13
 const TRACK_LEFT = DigitalPin.P14
 
-// Track GO timer state
-let goTimerActive = false
-let goEndTime = 0
-
-// Command structure
-interface Cmd {
-    s: number  // sequence number
-    o: string  // operation code
-    a: number  // argument 1 (speed/value)
-    b: number  // argument 2 (duration/value)
-    c: number  // optional argument 3 (for HL/BZ)
-}
+// Parsed command structure
+interface Cmd { s: number; o: string; a: number; b: number; c: number }
 
 // ===========================================================
-//  DISPLAY HELPERS
+//  UI HELPERS
 // ===========================================================
 
-/** Shows a small neutral "wait" icon when idle. */
-function showWait() {
-    basic.showIcon(IconNames.SmallDiamond)
-}
+/** Shows a neutral "waiting" icon when idle. */
+function showWait() { basic.showIcon(IconNames.SmallDiamond) }
 
-/** Briefly shows a stop icon before reverting to wait. */
-function showStopBrief() {
-    basic.showIcon(IconNames.No)
-    basic.pause(150)
-    showWait()
-}
+/** Briefly shows a stop icon, then returns to waiting. */
+function showStopBrief() { basic.showIcon(IconNames.No); basic.pause(150); showWait() }
 
 // ===========================================================
 //  TRACKING TELEMETRY
 // ===========================================================
 
-/**
- * Reads both line-tracking sensors.
- * Returns a 2-bit encoded value:
- *   0 = none, 1 = right only, 2 = left only, 3 = both active.
- */
+/** Reads both line sensors and encodes tracking state: 0 = none, 1 = right, 2 = left, 3 = both. */
 function readTracking(): number {
-    const rActive = pins.digitalReadPin(TRACK_RIGHT) == 0 ? 1 : 0
-    const lActive = pins.digitalReadPin(TRACK_LEFT) == 0 ? 1 : 0
-    return (rActive ? 1 : 0) | (lActive ? 2 : 0)
+    const r = pins.digitalReadPin(TRACK_RIGHT) == 0 ? 1 : 0
+    const l = pins.digitalReadPin(TRACK_LEFT) == 0 ? 2 : 0
+    return r | l
 }
 
-/** Sends current tracking state over Bluetooth (#TRK,<n>). */
-function sendTracking() {
-    const t = readTracking()
-    bluetooth.uartWriteString("#TRK," + t + "\n")
-}
+/** Sends #TRK telemetry string with current tracking state. */
+function sendTracking() { bluetooth.uartWriteString("#TRK," + readTracking() + "\n") }
 
-/** Sends an error message over Bluetooth (#ERROR,<text>). */
-function sendError(code: string) {
-    bluetooth.uartWriteString("#ERROR," + code + "\n")
-}
+/** Sends an #ERROR message string. */
+function sendError(msg: string) { bluetooth.uartWriteString("#ERROR," + msg + "\n") }
 
 // ===========================================================
 //  UTILITY FUNCTIONS
 // ===========================================================
 
-/** Parses a 1–2 digit hex string into an integer (0–255). */
+/** Parse 1–2 hex chars → 0..255. */
 function parseHexByte(s: string): number {
-    const t = s ? s.trim().toUpperCase() : ""
-    if (!t || t.length == 0) return 0
+    const t = (s || "").trim().toUpperCase()
+    if (!t) return 0
     let v = 0
     for (let i = 0; i < t.length && i < 2; i++) {
         const c = t.charCodeAt(i)
@@ -123,7 +94,7 @@ function parseHexByte(s: string): number {
     return v & 0xFF
 }
 
-/** Removes stray delimiters and non-printable characters from incoming strings. */
+/** Removes control chars and extra delimiters, trims whitespace. */
 function sanitize(raw: string): string {
     if (!raw) return ""
     let out = ""
@@ -137,105 +108,132 @@ function sanitize(raw: string): string {
     return out.trim()
 }
 
-/** Parses a command line into structured Cmd data. Returns null on failure. */
+/**
+ * Parse a line into Cmd structure:
+ * ARG1 (speed) in hex, ARG2 (duration) in decimal.
+ * e.g. ";01,MV,8C,1000;" → a = 0x8C, b = 1000
+ */
 function parseLine(line: string): Cmd {
     const clean = sanitize(line)
     if (!clean || clean.length < 2) return null
     let s = clean
     if (s.charAt(0) == ";") s = s.substr(1)
+
     const parts = s.split(",")
     if (parts.length < 2) return null
 
-    const seqHex = parts[0]
     let seqNum = 0
-    if (seqHex && seqHex.length > 0) {
-        const tmp = parseInt(seqHex, 16)
+    if (parts[0]) {
+        const tmp = parseInt(parts[0], 16)
         if (!isNaN(tmp)) seqNum = tmp & 0xFF
     }
+
     const op = (parts[1] || "").trim().toUpperCase()
-    const a = parts.length > 2 ? parseHexByte(parts[2]) : 0
-    const b = parts.length > 3 ? parseHexByte(parts[3]) : 0
-    const c = parts.length > 4 ? parseHexByte(parts[4]) : 0
+    if (!op) return null
+
+    const a = parts.length > 2 ? parseInt(parts[2].trim(), 16) & 0xFF : 0     // hex speed
+    const b = parts.length > 3 ? parseInt(parts[3].trim(), 10) : 0           // decimal ms
+    const c = parts.length > 4 ? parseInt(parts[4].trim(), 10) : 0
+
     return { s: seqNum, o: op, a: a, b: b, c: c }
 }
 
-/** Immediately halts all motor motion and clears any GO timer. */
+/** Stops Cutebot immediately and shows stop briefly. */
 function hardStop() {
     cuteBot.motors(0, 0)
     try { cuteBot.stopcar() } catch (e) { }
-    goTimerActive = false
     showStopBrief()
 }
 
+/** Converts byte (00..FF) → left/right speeds (0..100). */
+function splitSpeeds(byteVal: number): { l: number, r: number } {
+    const leftNib = (byteVal >> 4) & 0xF
+    const rightNib = byteVal & 0xF
+    const scale = (n: number) => Math.idiv(n * 100, 15)
+    return { l: scale(leftNib), r: scale(rightNib) }
+}
+
+/** Chooses an arrow icon for given wheel speeds. */
+function arrowForSpeeds(left: number, right: number): ArrowNames {
+    const TH = 10
+    if (left >= 0 && right >= 0) {
+        if (Math.abs(left - right) <= TH) return ArrowNames.South
+        return left > right ? ArrowNames.West : ArrowNames.East
+    }
+    if (left <= 0 && right <= 0) {
+        if (Math.abs(left - right) <= TH) return ArrowNames.North
+        return left < right ? ArrowNames.West : ArrowNames.East
+    }
+    if (left > 0 && right == 0) return ArrowNames.West
+    if (right > 0 && left == 0) return ArrowNames.East
+    if (left < 0 && right == 0) return ArrowNames.West
+    if (right < 0 && left == 0) return ArrowNames.East
+    return ArrowNames.South
+}
+
+/** Drives Cutebot for given ms with left/right speeds, shows arrow then #TRK. */
+function driveFor(left: number, right: number, ms: number, arrow: ArrowNames) {
+    if (ms <= 0) { hardStop(); sendTracking(); return }
+    basic.showArrow(arrow)
+    cuteBot.motors(left, right)
+    basic.pause(ms)
+    hardStop()
+    sendTracking()
+}
+
 // ===========================================================
-//  COMMAND EXECUTION LOGIC
+//  COMMAND EXECUTION
 // ===========================================================
 
-/**
- * Executes a single parsed command.
- * - Movement commands convert ms→s internally.
- * - GO uses an asynchronous timer check.
- */
+/** Executes a single parsed command. */
 function runNow(cmd: Cmd) {
     switch (cmd.o) {
-        case "MV": // Forward (milliseconds → seconds)
-            basic.showArrow(ArrowNames.South)
-            cuteBot.moveTime(cuteBot.Direction.forward, cmd.a, cmd.b / 1000)
-            showWait()
-            sendTracking()
+        case "MV": {
+            const sp = splitSpeeds(cmd.a)
+            driveFor(sp.l, sp.r, cmd.b, ArrowNames.South)
             break
-
-        case "BK": // Backward
-            basic.showArrow(ArrowNames.North)
-            cuteBot.moveTime(cuteBot.Direction.backward, cmd.a, cmd.b / 1000)
-            showWait()
-            sendTracking()
+        }
+        case "BK": {
+            const sp = splitSpeeds(cmd.a)
+            driveFor(-sp.l, -sp.r, cmd.b, ArrowNames.North)
             break
-
-        case "TL": // Turn Left
-            basic.showArrow(ArrowNames.East)
-            cuteBot.moveTime(cuteBot.Direction.left, cmd.a, cmd.b / 1000)
-            showWait()
-            sendTracking()
+        }
+        case "TL": {
+            const sp = splitSpeeds(cmd.a)
+            driveFor(-sp.l, sp.r, cmd.b, ArrowNames.East)
             break
-
-        case "TR": // Turn Right
-            basic.showArrow(ArrowNames.West)
-            cuteBot.moveTime(cuteBot.Direction.right, cmd.a, cmd.b / 1000)
-            showWait()
-            sendTracking()
+        }
+        case "TR": {
+            const sp = splitSpeeds(cmd.a)
+            driveFor(sp.l, -sp.r, cmd.b, ArrowNames.West)
             break
-
-        case "SP": // Hard Stop
+        }
+        case "SP":
             hardStop()
             sendTracking()
             break
 
-        case "GO": // Continuous Run (timed)
-            if (cmd.a == 0 || cmd.b == 0) {
-                hardStop()
-                sendError("GO_INVALID_ARGS")
-                break
-            }
-            basic.showArrow(ArrowNames.South)
-            cuteBot.motors(cmd.a, cmd.a)
-            goTimerActive = true
-            goEndTime = input.runningTime() + cmd.b
-            break
-
-        case "HL": { // Headlights (RGB or on/off)
-            let color: number
-            if (cmd.b > 0 || cmd.c > 0) {
-                color = ((cmd.a & 0xFF) << 16) | ((cmd.b & 0xFF) << 8) | (cmd.c & 0xFF)
-                cuteBot.colorLight(cuteBot.RGBLights.ALL, color)
-            } else {
-                color = cmd.a ? 0xFFFFFF : 0x000000
-                cuteBot.colorLight(cuteBot.RGBLights.ALL, color)
-            }
+        // GO now behaves like MV but with dynamic arrow from wheel bias.
+        case "GO": {
+            const sp = splitSpeeds(cmd.a)
+            if (cmd.b <= 0) { hardStop(); sendError("GO_INVALID_ARGS"); break }
+            if (sp.l == 0 && sp.r == 0) { showWait(); break } // no motion requested
+            const arrow = arrowForSpeeds(sp.l, sp.r)
+            driveFor(sp.l, sp.r, cmd.b, arrow)
             break
         }
 
-        case "BZ": { // Buzzer
+        case "HL": {
+            let color: number
+            if (cmd.b > 0 || cmd.c > 0)
+                color = ((cmd.a & 0xFF) << 16) | ((cmd.b & 0xFF) << 8) | (cmd.c & 0xFF)
+            else
+                color = cmd.a ? 0xFFFFFF : 0x000000
+            cuteBot.colorLight(cuteBot.RGBLights.ALL, color)
+            break
+        }
+
+        case "BZ": {
             const freq = ((cmd.a & 0xFF) << 8) | (cmd.b & 0xFF)
             let dur = (cmd.c & 0xFF) * 10
             if (dur <= 0) dur = 100
@@ -244,7 +242,7 @@ function runNow(cmd: Cmd) {
             break
         }
 
-        case "EC": // Echo / no-op
+        case "EC":
             break
 
         default:
@@ -254,45 +252,20 @@ function runNow(cmd: Cmd) {
 }
 
 // ===========================================================
-//  GO TIMER POLLING LOOP
-// ===========================================================
-
-/**
- * Every 100ms, checks whether the GO timer has expired.
- * If yes, stops the motors, sends #TRK telemetry, and clears the timer.
- */
-loops.everyInterval(100, function () {
-    if (goTimerActive && input.runningTime() >= goEndTime) {
-        hardStop()
-        sendTracking()
-        goTimerActive = false
-    }
-})
-
-// ===========================================================
 //  BLUETOOTH UART HANDLER
 // ===========================================================
 
-/**
- * Handles incoming UART data terminated by ';'.
- * Ignores empty segments caused by leading semicolons.
- * On valid commands, executes immediately.
- */
 bluetooth.onUartDataReceived(DELIM, function () {
     const raw = bluetooth.uartReadUntil(DELIM) || ""
-    const trimmed = raw.trim()
-    if (trimmed.length == 0) return
+    if (raw.trim().length == 0) return
 
     const cmd = parseLine(raw)
-    if (!cmd) {
-        sendError("PARSE_FAIL")
-        return
-    }
+    if (!cmd) { sendError("PARSE_FAIL"); return }
     runNow(cmd)
 })
 
 // ===========================================================
-//  STARTUP SEQUENCE
+//  STARTUP
 // ===========================================================
 
 showWait()
